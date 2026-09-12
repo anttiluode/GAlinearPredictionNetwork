@@ -1,37 +1,118 @@
 # GAlinearPredictionNetwork
 
-A matched, auditable test of a simple question:
+> **Conclusion: trajectory forecasting is a useful negative control, not the main architecture.**
 
-> Can an **online joint low-rank model of the current weight trajectory** skip useful chunks of neural-network training more effectively than per-parameter linear curve fitting?
+This repository began as a matched test of whether recent weight history could be used to fast-forward neural-network training. The first real CUDA run gave a clean answer for the simple per-parameter linear nowcaster: **it made training worse, not faster.**
 
-This repo does **not** start by claiming to beat Weight Nowcaster Network (WNN). It builds the comparison needed to find out.
+## Frozen seed-0 result
 
-## The four matched arms
+Command:
 
-All arms start from the same model weights, optimizer recipe, seed, and real-epoch data stream.
+```powershell
+python3.13 -m scripts.run_cifar10 --device cuda --seed 0
+```
+
+| arm | reached 59% | real epochs | backprops | forecast jumps | accuracy at stop | wall time |
+|---|---:|---:|---:|---:|---:|---:|
+| `plain` | yes | **30** | **1440** | 0 | 0.5907 | **788.495 s** |
+| `scalar_linear` | yes | 40 | 1920 | 7 | 0.5948 | 1071.952 s |
+
+Relative to plain training, the scalar nowcaster required:
+
+- **1.36x the wall time** — about **36% slower**;
+- **1.33x the backward passes** — 1920 instead of 1440;
+- ten additional real training epochs even after seven forecast jumps.
+
+The run was stopped when `joint_operator` began. **No result is claimed for `joint_operator` or `joint_guarded`.**
+
+This is a one-seed result on one benchmark. It does **not** disprove Weight Nowcaster Network, and this repository does not reproduce WNN's learned forecaster. It does establish the thing we needed to know locally: **blindly extending a recent parameter trajectory is not automatically a training accelerator, even when the forecast itself is cheap enough to try.**
+
+## Why keep this repository?
+
+Because the failure separates two questions that looked similar earlier in the day:
+
+### Forecasting
+
+> Where is the optimizer likely to go next?
+
+A trajectory model tries to infer
+
+\[
+\theta_{t+h} \approx F(\theta_{t-k:t}).
+\]
+
+That can be useful when training dynamics are smooth, but it treats the recent path as if it were one coherent object to extrapolate.
+
+### Compatibility
+
+> How does a proposed change collide with computations that must remain viable?
+
+That is the stronger question exposed by `ThirdWay`. Instead of replacing the optimizer with a predictor, let the optimizer propose a change
+
+\[
+\Delta_t,
+\]
+
+then decompose what the existing structure can safely absorb from what remains as signed geometric debt:
+
+\[
+\Delta_t = \Delta_t^{\mathrm{compatible}} + r_t.
+\]
+
+Repeated coherent residual is then evidence for **structural growth / route separation**, not evidence that the system should average conflicting trajectories.
+
+That is the conceptual boundary this repository now records:
+
+```text
+trajectory forecast
+    predicts where weights may go
+
+compatibility mechanism
+    decides how a proposed change may safely become structure
+```
+
+The second problem is the one carried forward into `ThirdWay`.
+
+## The lethal-average test this repo points toward
+
+The next useful experiment is not a better nowcaster. Construct two viable computations, A and B, such that both work individually but their parameter-space average falls into dead space:
+
+\[
+W_A \text{ works},\qquad W_B \text{ works},\qquad
+\frac{W_A+W_B}{2} \text{ fails}.
+\]
+
+Then feed alternating or conflicting useful update directions to three systems:
+
+1. direct shared update;
+2. trajectory prediction / averaging;
+3. ThirdWay compatibility decomposition with signed residual and structural growth.
+
+The question becomes whether the third system recognizes that the apparent temporal fluctuation is actually **two incompatible demands on shared structure** and grows/separates rather than averaging them away.
+
+That experiment belongs in `ThirdWay`, not here.
+
+## What is still in this repository
+
+The code remains as an auditable benchmark/negative control with four arms:
 
 | arm | behavior |
 |---|---|
 | `plain` | ordinary training only |
-| `scalar_linear` | fit an independent line to each weight over the last 5 real epochs and predict 5 epochs ahead |
-| `joint_operator` | discover the low-rank joint trajectory subspace, fit an affine operator there, and predict 5 epochs ahead |
-| `joint_guarded` | same joint predictor, but pay for a forward-only validation check and reject a harmful jump |
+| `scalar_linear` | independent linear fit to each parameter over recent real epochs |
+| `joint_operator` | reduced joint trajectory operator |
+| `joint_guarded` | joint operator with a counted forward-only validation guard |
 
-A forecast never calls `backward()`. Actual backward passes, predictor time, forward guard checks, accepted/rejected jumps, validation accuracy, and total wall-clock time are counted separately.
+The anti-cheating contracts remain useful:
 
-## Why this benchmark
+- predictors only see already-observed real training states;
+- forecast jumps never call `backward()`;
+- forecast-generated states are not fed back as observed history;
+- rejected guarded jumps restore the exact pre-jump parameters;
+- NaN/Inf is visible and never silently reseeded;
+- backward passes, guard checks, predictor time, jumps, validation metrics, and wall time are counted separately.
 
-Jang et al., **Learning to Boost Training by Periodic Nowcasting Near Future Weights** (ICML 2023), report on CIFAR-10/VanillaCNN that ordinary training reached 59% validation accuracy in 52.82 s, linear curve fitting in 39.71 s (1.33x), and learned WNN in 25.27 s (2.09x) on a TITAN Xp. Their ablation found a 5-epoch history and 5-epoch forecast horizon best among the tested choices.
-
-Paper: https://proceedings.mlr.press/v202/jang23b.html
-
-Public code: https://github.com/jjh6297/WNN
-
-The public CIFAR-10 script uses four 3x3 convolution layers with channels `[8,16,32,32]`, max-pooling after each, a 64-unit dense layer, Adam at `1e-3`, batch size 1024, per-pixel training-mean subtraction, and augmentation with rotation 10 degrees, width/height shift 0.15, and zoom 0.3. This repo translates that recipe to PyTorch and uses the same 5-real-epochs -> forecast-5-epochs periodic schedule.
-
-It is still **not an exact bit-for-bit WNN reproduction**: the original target model is TensorFlow/Keras, augmentation implementations differ slightly, and this repo does not run the learned WNN network itself. The fair direct comparison here is `scalar_linear` versus the new joint predictor on the same PyTorch run. The paper's WNN numbers remain an external target until reproduced under sufficiently matched conditions.
-
-## Fast CPU contract test
+## Reproduce the CPU contracts
 
 ```bash
 python -m pip install -e '.[test,benchmark]'
@@ -39,82 +120,24 @@ python -m pytest -q
 python -m scripts.run_smoke
 ```
 
-The smoke run uses a tiny deterministic synthetic task. It is there to catch cheating and broken counters, not to establish a speed record.
+The smoke benchmark is only a chronology/counter test. It is not evidence for acceleration.
 
-## Main CIFAR-10 GPU test
+## Historical motivation
 
-Install a CUDA-enabled PyTorch build appropriate for your machine, then install this repo without replacing it.
+Jang et al., *Learning to Boost Training by Periodic Nowcasting Near Future Weights* (ICML 2023), showed that a learned Weight Nowcaster Network can periodically forecast future weights and accelerate some training runs. This repo originally translated their small CIFAR-10 target-model recipe to PyTorch and compared simple per-coordinate extrapolation with an online joint reduced operator.
 
-```bash
-python -m pip install -e '.[test,benchmark]'
-python -m scripts.run_cifar10 --device cuda --seed 0
-```
+Paper: https://proceedings.mlr.press/v202/jang23b.html
 
-Defaults intentionally follow the public WNN short-term CIFAR setup where practical:
+Public code: https://github.com/jjh6297/WNN
 
-```text
-real-epoch cap     50
-history             5
-forecast horizon    5
-batch size        1024
-Adam LR          1e-3
-target accuracy   0.59
-```
+The frozen negative result above is **not** a reproduction or refutation of WNN. It is the result for this repo's simple scalar linear control.
 
-The run writes JSON and CSV receipts under `results/`.
-
-For the five-trial comparison used in the WNN paper, run seeds 0 through 4. In PowerShell:
-
-```powershell
-0..4 | ForEach-Object { python -m scripts.run_cifar10 --device cuda --seed $_ }
-```
-
-## What counts as a win
-
-The primary result is **not** parameter forecast error and not merely fewer backward passes.
-
-For a practical acceleration claim, `joint_guarded` should reach the frozen 59% accuracy threshold in less **measured wall-clock time** than both:
-
-1. `plain`, and
-2. `scalar_linear`.
-
-The useful summary is
-
-```text
-plain seconds / joint_guarded seconds
-```
-
-on the same hardware, same seed, same data recipe.
-
-A result above the WNN paper's 2.09x figure would be interesting, but it is not by itself a direct claim of beating WNN unless the benchmark conditions are close enough. A strong result across five seeds is much more meaningful than a single lucky run.
-
-## Non-cheating rules
-
-- predictors receive only already-observed real-epoch weight states;
-- the first forecast waits for five complete real epochs;
-- after a forecast, history is cleared and rebuilt from new real training before another forecast;
-- forecast jumps never increment the backward counter;
-- `joint_guarded` restores the exact pre-jump weights on rejection;
-- NaN/Inf proposals are reported and never silently reseeded;
-- CUDA synchronization surrounds measured predictor/whole-run timing boundaries;
-- all arms are re-seeded so the kth **real** training epoch receives the same shuffle/augmentation stream.
-
-## Core math
-
-Scalar baseline, independently for every weight:
+## Bottom line
 
 \[
-\theta_j(t) \approx a_jt+b_j.
+\boxed{\text{Prediction is not preservation.}}
 \]
 
-Joint operator: stack the latest weight vectors, center them, compute a small observed SVD basis, and fit
+The seed-0 run made that distinction concrete. The nowcaster asked where the training trajectory was going and lost time. The architectural work continues with the different question: **which part of a proposed update is compatible with the computations already present, and what should happen to the incompatible residual?**
 
-\[
-z_{t+1}\approx z_tA+b,
-\qquad
-\theta_t\approx \bar\theta + Uz_t.
-\]
-
-Only the small reduced state is propagated five steps. The full weight vector is reconstructed once at the end.
-
-The experiment therefore tests whether **cross-parameter trajectory structure contains useful predictive information that element-wise curve fitting throws away**.
+A static summary suitable for GitHub Pages lives at [`docs/index.html`](docs/index.html).
